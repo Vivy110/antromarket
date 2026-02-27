@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                          AntroMarket_Gold_EA.mq5 |
-//|                                              AntroMarket EA v1.1 |
+//|                                              AntroMarket EA v1.2 |
 //|                                                                  |
 //|  Strategy: Multi-Confirmation Scalping for XAUUSD M1             |
 //|  Indicators:                                                     |
@@ -15,17 +15,20 @@
 //|    - Trailing Stop                                               |
 //|    - Max 1 position per direction                                |
 //|    - Session filter (London & New York only)                     |
-//|  v1.1 Fixes:                                                     |
-//|    - Relaxed signal scoring (min 3 of 5)                         |
-//|    - Fixed lot size calculation                                  |
-//|    - Auto-detect order filling type                              |
-//|    - Added debug logging for signal scores                       |
-//|    - Relaxed RSI signal conditions                               |
-//|    - Added MACD histogram trend as alternative confirmation      |
+//|  v1.2 Fixes:                                                     |
+//|    - Fixed overlapping buy/sell RSI conditions (now mutually     |
+//|      exclusive: buy RSI>50, sell RSI<50)                         |
+//|    - Fixed BB signal: buy near lower band, sell near upper band  |
+//|    - Added full EMA alignment check (EMA9>EMA21>EMA50 for buy)   |
+//|    - Session filter now uses broker server time (TimeCurrent)    |
+//|      with configurable GMT offset                                |
+//|    - Added score gap requirement to avoid ambiguous signals      |
+//|    - Added minimum score gap: buyScore must exceed sellScore     |
+//|    - Fixed MACD histogram direction as additional confirmation   |
 //+------------------------------------------------------------------+
 
-#property copyright   "AntroMarket EA v1.1"
-#property version     "1.10"
+#property copyright   "AntroMarket EA v1.2"
+#property version     "1.20"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -47,6 +50,7 @@ input int      MACD_Slow       = 26;         // MACD Slow EMA
 input int      MACD_Signal     = 9;          // MACD Signal
 input int      ATR_Period      = 14;         // Period ATR
 input int      MinConfirmations = 3;         // Minimum konfirmasi sinyal (1-5)
+input int      MinScoreGap     = 1;          // Selisih minimum skor buy vs sell
 
 input group "=== RISK MANAGEMENT ==="
 input double   RiskPercent     = 1.0;        // Risk per trade (% dari balance)
@@ -69,6 +73,7 @@ input int      NYOpen             = 12;      // Jam buka New York (UTC)
 input int      NYClose            = 21;      // Jam tutup New York (UTC)
 input int      AsiaOpen           = 0;       // Jam buka Asia (UTC)
 input int      AsiaClose          = 7;       // Jam tutup Asia (UTC)
+input int      BrokerGMTOffset    = 2;       // Offset GMT broker server (jam, biasanya 2 atau 3)
 
 input group "=== PENGATURAN LAINNYA ==="
 input ulong    MagicNumber     = 20240101;   // Magic Number EA
@@ -147,10 +152,12 @@ int OnInit()
     Trade.SetTypeFilling(fillingType);
     Print("Order filling type: ", EnumToString(fillingType));
 
-    Print("AntroMarket Gold EA v1.1 - Initialized successfully");
+    Print("AntroMarket Gold EA v1.2 - Initialized successfully");
     Print("Symbol: ", _Symbol, " | Timeframe: M1");
     Print("Strategy: EMA Trend + RSI + Bollinger Bands + MACD + ATR");
-    Print("Min Confirmations: ", MinConfirmations, " | Max Spread: ", MaxSpread);
+    Print("Min Confirmations: ", MinConfirmations, " | Min Score Gap: ", MinScoreGap,
+          " | Max Spread: ", MaxSpread);
+    Print("Broker GMT Offset: ", BrokerGMTOffset, " hours");
 
     return INIT_SUCCEEDED;
 }
@@ -205,7 +212,7 @@ void OnTick()
     lastBarTime = currentBar;
 
     // Ambil data indikator
-    if(!RefreshIndicatorData()) 
+    if(!RefreshIndicatorData())
     {
         if(EnableDebugLog) Print("DEBUG: RefreshIndicatorData gagal");
         return;
@@ -216,9 +223,13 @@ void OnTick()
     {
         if(EnableDebugLog)
         {
+            // Tampilkan jam server broker dan jam UTC yang dihitung
+            datetime serverTime = TimeCurrent();
             MqlDateTime dt;
-            TimeToStruct(TimeGMT(), dt);
-            Print("DEBUG: Sesi tidak aktif. Jam UTC: ", dt.hour, ":", dt.min);
+            TimeToStruct(serverTime, dt);
+            int utcHour = (dt.hour - BrokerGMTOffset + 24) % 24;
+            Print("DEBUG: Sesi tidak aktif. Jam Server: ", dt.hour, ":", dt.min,
+                  " | Jam UTC (calc): ", utcHour);
         }
         return;
     }
@@ -274,60 +285,101 @@ bool RefreshIndicatorData()
 int GetTradingSignal()
 {
     // --- Nilai indikator candle terakhir (index 1 = closed candle) ---
-    double emaFast = emaFastBuf[1];
-    double emaMid  = emaMidBuf[1];
-    double emaSlow = emaSlowBuf[1];
+    double emaFast     = emaFastBuf[1];
+    double emaMid      = emaMidBuf[1];
+    double emaSlow     = emaSlowBuf[1];
+    double emaFastPrev = emaFastBuf[2];
+    double emaMidPrev  = emaMidBuf[2];
+
     double rsi     = rsiBuf[1];
     double rsiPrev = rsiBuf[2];
+
     double bbUpper = bbUpperBuf[1];
     double bbLower = bbLowerBuf[1];
     double bbMid   = bbMidBuf[1];
+    double bbWidth = bbUpper - bbLower;
+
     double macdMain    = macdMainBuf[1];
     double macdSig     = macdSignalBuf[1];
     double macdMainPrev= macdMainBuf[2];
     double macdSigPrev = macdSignalBuf[2];
-    double atr     = atrBuf[1];
+    // MACD histogram = main - signal
+    double macdHist     = macdMain - macdSig;
+    double macdHistPrev = macdMainPrev - macdSigPrev;
 
+    double atr        = atrBuf[1];
     double closePrice = iClose(_Symbol, PERIOD_M1, 1);
     double openPrice  = iOpen(_Symbol, PERIOD_M1, 1);
     bool   isBullishCandle = (closePrice > openPrice);
     bool   isBearishCandle = (closePrice < openPrice);
 
-    // === KONDISI BUY ===
-    // 1. Trend bullish: EMA9 > EMA21 (minimal 2 EMA aligned)
-    bool emaBullish = (emaFast > emaMid);
-    // 2. RSI tidak overbought dan dalam zona bullish (lebih longgar)
-    bool rsiBuySignal = (rsi > 40.0) && (rsi < RSI_Overbought - 5.0);
-    // 3. Harga di bawah BB upper (ada ruang naik)
-    bool bbBuySignal = (closePrice < bbUpper) && (closePrice > bbLower);
-    // 4. MACD bullish: main di atas signal ATAU crossover bullish
-    bool macdBullish = (macdMain > macdSig) ||
-                       ((macdMainPrev < macdSigPrev) && (macdMain > macdSig));
+    // BB band width threshold: hanya entry jika BB cukup lebar (ada volatilitas)
+    // Minimal lebar BB = 0.5 * ATR agar tidak entry di pasar flat
+    bool bbHasVolatility = (bbWidth >= atr * 0.5);
+
+    // ================================================================
+    // === KONDISI BUY (semua kondisi bersifat BULLISH / directional) ===
+    // ================================================================
+
+    // 1. EMA alignment bullish: EMA9 > EMA21 > EMA50 (full alignment)
+    //    ATAU minimal EMA9 > EMA21 DAN EMA9 sedang naik
+    bool emaFullBullish = (emaFast > emaMid) && (emaMid > emaSlow);
+    bool emaPartBullish = (emaFast > emaMid) && (emaFast > emaFastPrev);
+    bool emaBullish     = emaFullBullish || emaPartBullish;
+
+    // 2. RSI bullish: RSI > 50 (momentum bullish) dan tidak overbought
+    //    RSI juga harus naik dari bar sebelumnya (konfirmasi momentum)
+    bool rsiBuySignal = (rsi > 50.0) && (rsi < RSI_Overbought) && (rsi >= rsiPrev);
+
+    // 3. BB buy signal: harga di atas BB middle (trend bullish dalam BB)
+    //    ATAU harga baru saja bounce dari BB lower (reversal)
+    bool bbAboveMid   = (closePrice > bbMid);
+    bool bbBounce     = (closePrice > bbLower) && (closePrice <= bbMid) &&
+                        (iClose(_Symbol, PERIOD_M1, 2) <= bbLower);
+    bool bbBuySignal  = bbHasVolatility && (bbAboveMid || bbBounce);
+
+    // 4. MACD bullish: histogram positif DAN sedang naik
+    bool macdBullish = (macdHist > 0) && (macdHist > macdHistPrev);
+
     // 5. Candle bullish
     bool candleBuy = isBullishCandle;
 
     // Hitung skor konfirmasi BUY
-    int buyScore = (emaBullish ? 1 : 0) + (rsiBuySignal ? 1 : 0) +
-                   (bbBuySignal ? 1 : 0) + (macdBullish ? 1 : 0) +
-                   (candleBuy ? 1 : 0);
+    int buyScore = (emaBullish  ? 1 : 0) + (rsiBuySignal ? 1 : 0) +
+                   (bbBuySignal ? 1 : 0) + (macdBullish  ? 1 : 0) +
+                   (candleBuy   ? 1 : 0);
 
-    // === KONDISI SELL ===
-    // 1. Trend bearish: EMA9 < EMA21
-    bool emaBearish = (emaFast < emaMid);
-    // 2. RSI tidak oversold dan dalam zona bearish (lebih longgar)
-    bool rsiSellSignal = (rsi < 60.0) && (rsi > RSI_Oversold + 5.0);
-    // 3. Harga di atas BB lower (ada ruang turun)
-    bool bbSellSignal = (closePrice > bbLower) && (closePrice < bbUpper);
-    // 4. MACD bearish: main di bawah signal ATAU crossover bearish
-    bool macdBearish = (macdMain < macdSig) ||
-                       ((macdMainPrev > macdSigPrev) && (macdMain < macdSig));
+    // ================================================================
+    // === KONDISI SELL (semua kondisi bersifat BEARISH / directional) ===
+    // ================================================================
+
+    // 1. EMA alignment bearish: EMA9 < EMA21 < EMA50 (full alignment)
+    //    ATAU minimal EMA9 < EMA21 DAN EMA9 sedang turun
+    bool emaFullBearish = (emaFast < emaMid) && (emaMid < emaSlow);
+    bool emaPartBearish = (emaFast < emaMid) && (emaFast < emaFastPrev);
+    bool emaBearish     = emaFullBearish || emaPartBearish;
+
+    // 2. RSI bearish: RSI < 50 (momentum bearish) dan tidak oversold
+    //    RSI juga harus turun dari bar sebelumnya (konfirmasi momentum)
+    bool rsiSellSignal = (rsi < 50.0) && (rsi > RSI_Oversold) && (rsi <= rsiPrev);
+
+    // 3. BB sell signal: harga di bawah BB middle (trend bearish dalam BB)
+    //    ATAU harga baru saja rejection dari BB upper (reversal)
+    bool bbBelowMid   = (closePrice < bbMid);
+    bool bbRejection  = (closePrice < bbUpper) && (closePrice >= bbMid) &&
+                        (iClose(_Symbol, PERIOD_M1, 2) >= bbUpper);
+    bool bbSellSignal = bbHasVolatility && (bbBelowMid || bbRejection);
+
+    // 4. MACD bearish: histogram negatif DAN sedang turun
+    bool macdBearish = (macdHist < 0) && (macdHist < macdHistPrev);
+
     // 5. Candle bearish
     bool candleSell = isBearishCandle;
 
     // Hitung skor konfirmasi SELL
-    int sellScore = (emaBearish ? 1 : 0) + (rsiSellSignal ? 1 : 0) +
-                    (bbSellSignal ? 1 : 0) + (macdBearish ? 1 : 0) +
-                    (candleSell ? 1 : 0);
+    int sellScore = (emaBearish   ? 1 : 0) + (rsiSellSignal ? 1 : 0) +
+                    (bbSellSignal ? 1 : 0) + (macdBearish   ? 1 : 0) +
+                    (candleSell   ? 1 : 0);
 
     // Filter: tidak entry jika RSI di zona ekstrem berlawanan arah
     bool buyFilter  = (rsi < RSI_Overbought);   // tidak beli saat RSI overbought
@@ -346,13 +398,28 @@ int GetTradingSignal()
               " [EMA:", emaBearish, " RSI:", rsiSellSignal,
               " BB:", bbSellSignal, " MACD:", macdBearish, " Candle:", candleSell, "]",
               " | RSI=", DoubleToString(rsi, 1),
-              " | EMAFast=", DoubleToString(emaFast, 2),
-              " | EMAMid=", DoubleToString(emaMid, 2),
-              " | Close=", DoubleToString(closePrice, 2));
+              " | RSIPrev=", DoubleToString(rsiPrev, 1),
+              " | MACDHist=", DoubleToString(macdHist, 5),
+              " | MACDHistPrev=", DoubleToString(macdHistPrev, 5),
+              " | Close=", DoubleToString(closePrice, 2),
+              " | BBMid=", DoubleToString(bbMid, 2),
+              " | BBWidth=", DoubleToString(bbWidth, 2));
     }
 
-    if(buyScore >= MinConfirmations && buyFilter && noBuyPos)   return 1;
-    if(sellScore >= MinConfirmations && sellFilter && noSellPos) return -1;
+    // Entry hanya jika:
+    // 1. Skor mencapai minimum
+    // 2. Skor lebih tinggi dari arah berlawanan (gap minimum)
+    // 3. Filter RSI tidak ekstrem
+    // 4. Tidak ada posisi berlawanan
+    bool buyCondition  = (buyScore  >= MinConfirmations) &&
+                         (buyScore  >= sellScore + MinScoreGap) &&
+                         buyFilter  && noBuyPos;
+    bool sellCondition = (sellScore >= MinConfirmations) &&
+                         (sellScore >= buyScore  + MinScoreGap) &&
+                         sellFilter && noSellPos;
+
+    if(buyCondition)  return 1;
+    if(sellCondition) return -1;
 
     return 0;
 }
@@ -550,16 +617,22 @@ void ManageTrailingStop()
 
 //+------------------------------------------------------------------+
 //| Cek apakah sesi aktif                                            |
+//| Menggunakan TimeCurrent() (jam server broker) dikurangi offset   |
+//| untuk mendapatkan jam UTC                                        |
 //+------------------------------------------------------------------+
 bool IsSessionActive()
 {
+    // Konversi jam server broker ke UTC
+    datetime serverTime = TimeCurrent();
     MqlDateTime dt;
-    TimeToStruct(TimeGMT(), dt);
-    int hour = dt.hour;
+    TimeToStruct(serverTime, dt);
 
-    bool london = UseLondonSession  && (hour >= LondonOpen && hour < LondonClose);
-    bool ny     = UseNewYorkSession && (hour >= NYOpen     && hour < NYClose);
-    bool asia   = UseAsiaSession    && (hour >= AsiaOpen   && hour < AsiaClose);
+    // Hitung jam UTC dari jam server broker
+    int utcHour = (dt.hour - BrokerGMTOffset + 24) % 24;
+
+    bool london = UseLondonSession  && (utcHour >= LondonOpen && utcHour < LondonClose);
+    bool ny     = UseNewYorkSession && (utcHour >= NYOpen     && utcHour < NYClose);
+    bool asia   = UseAsiaSession    && (utcHour >= AsiaOpen   && utcHour < AsiaClose);
 
     return (london || ny || asia);
 }
@@ -645,18 +718,21 @@ void UpdateDashboard()
     int    total    = totalWins + totalLoss;
     double winRate  = (total > 0) ? (double)totalWins / total * 100 : 0;
 
+    datetime serverTime = TimeCurrent();
     MqlDateTime dt;
-    TimeToStruct(TimeGMT(), dt);
+    TimeToStruct(serverTime, dt);
+    int utcHour = (dt.hour - BrokerGMTOffset + 24) % 24;
     bool sessionActive = IsSessionActive();
 
     string dash = "";
     dash += "╔═══════════════════════════════╗\n";
-    dash += "║   ANTROMARKET GOLD EA v1.1    ║\n";
+    dash += "║   ANTROMARKET GOLD EA v1.2    ║\n";
     dash += "╠═══════════════════════════════╣\n";
     dash += StringFormat("║  Symbol   : %-18s ║\n", _Symbol);
     dash += StringFormat("║  Spread   : %-18s ║\n", IntegerToString(spread) + " pts");
     dash += StringFormat("║  ATR      : %-18s ║\n", DoubleToString(atr, 2));
     dash += StringFormat("║  RSI      : %-18s ║\n", DoubleToString(rsi, 1));
+    dash += StringFormat("║  UTC Hour : %-18s ║\n", IntegerToString(utcHour) + ":xx");
     dash += StringFormat("║  Session  : %-18s ║\n", sessionActive ? "ACTIVE" : "CLOSED");
     dash += StringFormat("║  Trades   : %-18s ║\n", IntegerToString(trades));
     dash += "╠═══════════════════════════════╣\n";
