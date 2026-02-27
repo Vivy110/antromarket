@@ -270,8 +270,8 @@ int GetTradingSignal()
     bool sellFilter = (rsi > RSI_Oversold + 10);    // tidak jual saat RSI sangat rendah
 
     // Tidak ada posisi berlawanan arah yang sudah terbuka
-    bool noBuyPos  = !HasOpenPosition(ORDER_TYPE_BUY);
-    bool noSellPos = !HasOpenPosition(ORDER_TYPE_SELL);
+    bool noBuyPos  = !HasOpenPosition(POSITION_TYPE_BUY);
+    bool noSellPos = !HasOpenPosition(POSITION_TYPE_SELL);
 
     if(buyScore >= 4 && buyFilter && noBuyPos)   return 1;
     if(sellScore >= 4 && sellFilter && noSellPos) return -1;
@@ -351,9 +351,9 @@ double CalculateLotSize(double slDistance)
     double riskAmount   = balance * (RiskPercent / 100.0);
     double tickValue    = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
     double tickSize     = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-    double pointValue   = tickValue / tickSize;
-    double slInPoints   = slDistance / _Point;
-    double lots         = riskAmount / (slInPoints * pointValue * _Point / tickSize * tickValue);
+    // lots = riskAmount / (slDistance / tickSize * tickValue)
+    // slDistance/tickSize = jumlah tick dalam SL; tiap tick senilai tickValue per lot
+    double lots         = riskAmount / (slDistance / tickSize * tickValue);
 
     // Normalisasi lot
     double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
@@ -390,18 +390,21 @@ void ManageTrailingStop()
 
         if(posType == POSITION_TYPE_BUY)
         {
-            double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
             double profit = bid - openPrice;
 
-            // Break Even
+            // Break Even: pindahkan SL ke open price + 1 point saat profit cukup
             if(profit >= beDist && currentSL < openPrice)
             {
                 double newSL = NormalizeDouble(openPrice + _Point, digits);
                 if(newSL > currentSL)
+                {
                     Trade.PositionModify(PositionGetTicket(i), newSL, currentTP);
+                    continue; // SL sudah dimodifikasi, lanjut ke posisi berikutnya
+                }
             }
-            // Trailing Stop
-            else if(profit > trailDist)
+            // Trailing Stop: jalankan independen dari Break Even
+            if(profit > trailDist)
             {
                 double newSL = NormalizeDouble(bid - trailDist, digits);
                 if(newSL > currentSL)
@@ -413,15 +416,18 @@ void ManageTrailingStop()
             double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
             double profit = openPrice - ask;
 
-            // Break Even
+            // Break Even: pindahkan SL ke open price - 1 point saat profit cukup
             if(profit >= beDist && currentSL > openPrice)
             {
                 double newSL = NormalizeDouble(openPrice - _Point, digits);
                 if(newSL < currentSL)
+                {
                     Trade.PositionModify(PositionGetTicket(i), newSL, currentTP);
+                    continue; // SL sudah dimodifikasi, lanjut ke posisi berikutnya
+                }
             }
-            // Trailing Stop
-            else if(profit > trailDist)
+            // Trailing Stop: jalankan independen dari Break Even
+            if(profit > trailDist)
             {
                 double newSL = NormalizeDouble(ask + trailDist, digits);
                 if(newSL < currentSL)
@@ -451,8 +457,8 @@ bool IsSessionActive()
 //+------------------------------------------------------------------+
 bool CheckSpread()
 {
-    double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-    return (spread <= MaxSpread);
+    long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+    return (spread <= (long)MaxSpread);
 }
 
 //+------------------------------------------------------------------+
@@ -476,7 +482,7 @@ int CountOpenTrades()
 //+------------------------------------------------------------------+
 //| Cek apakah ada posisi terbuka berdasarkan tipe                   |
 //+------------------------------------------------------------------+
-bool HasOpenPosition(ENUM_ORDER_TYPE type)
+bool HasOpenPosition(ENUM_POSITION_TYPE type)
 {
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
@@ -484,7 +490,7 @@ bool HasOpenPosition(ENUM_ORDER_TYPE type)
         {
             if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
                PositionGetString(POSITION_SYMBOL) == _Symbol &&
-               PositionGetInteger(POSITION_TYPE)  == type)
+               (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == type)
                 return true;
         }
     }
