@@ -1,760 +1,600 @@
 //+------------------------------------------------------------------+
 //|                                          AntroMarket_Gold_EA.mq5 |
-//|                                              AntroMarket EA v2.0 |
+//|                                              AntroMarket EA v3.0 |
 //|                                                                  |
-//|  Strategy: Multi-Confirmation Scalping for XAUUSD M1             |
-//|  Indicators:                                                     |
-//|    1. EMA 9/21/50  - Trend Direction (M1 + HTF M5 filter)        |
-//|    2. RSI(7)       - Momentum overbought/oversold (lebih sensitif)|
-//|    3. Bollinger Bands(20,2) - Volatility & mean reversion        |
-//|    4. ATR(14)      - Dynamic SL/TP                               |
-//|    5. MACD(5,13,4) - Fast crossover untuk scalping               |
-//|    6. Stochastic(5,3,3) - Entry timing konfirmasi                |
-//|  Entry Strategies:                                               |
-//|    A. BB Bounce + RSI reversal (mean reversion)                  |
-//|    B. EMA Pullback + MACD confirm (trend continuation)           |
-//|    C. BB Breakout squeeze (momentum breakout)                    |
+//|  Strategy: Multi-Confirmation Scalping XAUUSD M1                 |
+//|  FIXES v3.0:                                                     |
+//|   - Session filter: pakai TimeCurrent() bukan TimeGMT()          |
+//|     (TimeGMT tidak jalan di Strategy Tester)                     |
+//|   - BB Bounce: toleransi ATR-based bukan % dari harga            |
+//|   - Cooldown: init lastTradeTime = 0 tidak lagi block entry awal  |
+//|   - HTF buffer: fallback ke index[0] jika [1] belum ready        |
+//|   - Entry logic disederhanakan, score lebih mudah terpenuhi      |
+//|   - Tambah Print debug untuk diagnosa filter mana yang block      |
 //+------------------------------------------------------------------+
 
-#property copyright   "AntroMarket EA v2.0"
-#property version     "2.00"
+#property copyright   "AntroMarket EA v3.0"
+#property version     "3.00"
 #property strict
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #include <Trade\SymbolInfo.mqh>
 
-//--- Input Parameters
-input group "=== STRATEGI ==="
-input int      EMA_Fast        = 9;          // EMA Cepat (M1)
-input int      EMA_Mid         = 21;         // EMA Tengah (M1)
-input int      EMA_Slow        = 50;         // EMA Lambat (M1)
-input int      RSI_Period      = 7;          // Period RSI (7 lebih sensitif utk scalping)
-input double   RSI_Overbought  = 72.0;       // RSI Overbought
-input double   RSI_Oversold    = 28.0;       // RSI Oversold
-input int      BB_Period       = 20;         // Period Bollinger Band
-input double   BB_Dev          = 2.0;        // Deviasi Bollinger Band
-input int      MACD_Fast       = 5;          // MACD Fast EMA (lebih cepat utk scalping)
-input int      MACD_Slow       = 13;         // MACD Slow EMA
-input int      MACD_Signal     = 4;          // MACD Signal
-input int      ATR_Period      = 14;         // Period ATR
-input int      Stoch_K         = 5;          // Stochastic %K
-input int      Stoch_D         = 3;          // Stochastic %D
-input int      Stoch_Slowing   = 3;          // Stochastic Slowing
-input double   Stoch_OB        = 80.0;       // Stochastic Overbought
-input double   Stoch_OS        = 20.0;       // Stochastic Oversold
+//============================================================
+//  INPUT PARAMETERS
+//============================================================
+input group "=== INDIKATOR ==="
+input int    EMA_Fast       = 9;
+input int    EMA_Mid        = 21;
+input int    EMA_Slow       = 50;
+input int    RSI_Period     = 7;
+input int    BB_Period      = 20;
+input double BB_Dev         = 2.0;
+input int    MACD_Fast      = 5;
+input int    MACD_Slow      = 13;
+input int    MACD_Signal    = 4;
+input int    ATR_Period     = 14;
+input int    Stoch_K        = 5;
+input int    Stoch_D        = 3;
+input int    Stoch_Slow     = 3;
 
-input group "=== HTF FILTER ==="
-input bool     UseHTF_Filter   = true;       // Gunakan filter Higher Timeframe
-input ENUM_TIMEFRAMES HTF_TF   = PERIOD_M5;  // Timeframe HTF (M5 recommended)
-input int      HTF_EMA_Period  = 21;         // EMA period di HTF
-
-input group "=== ENTRY STRATEGY ==="
-input bool     UseStrategy_BBBounce  = true; // Strategi A: BB Bounce (mean reversion)
-input bool     UseStrategy_Pullback  = true; // Strategi B: EMA Pullback (trend follow)
-input bool     UseStrategy_Breakout  = true; // Strategi C: BB Breakout squeeze
-input int      MinScoreRequired      = 3;    // Min skor konfirmasi (3 dari 5, lebih aktif)
-input bool     RequireRSI_For_Entry  = false;// RSI wajib (false = lebih banyak entry)
+input group "=== ENTRY SETTINGS ==="
+input int    MinConfirm     = 2;      // Min konfirmasi untuk entry (2 = lebih banyak trade)
+input bool   UseHTF         = true;   // Filter HTF M5
+input int    HTF_EMA        = 21;     // Period EMA di M5
 
 input group "=== RISK MANAGEMENT ==="
-input double   RiskPercent     = 1.0;        // Risk per trade (% dari balance)
-input double   ATR_SL_Multi    = 1.2;        // Multiplier ATR untuk Stop Loss (lebih ketat)
-input double   ATR_TP_Multi    = 1.8;        // Multiplier ATR untuk Take Profit (RR 1:1.5)
-input bool     UseTrailingStop = true;       // Gunakan Trailing Stop
-input double   TrailATR_Multi  = 0.8;        // Multiplier ATR untuk Trailing
-input double   BreakEvenATR    = 0.8;        // Pindah ke BE setelah X * ATR profit
-input int      MaxOpenTrades   = 2;          // Max posisi terbuka bersamaan
-input double   MaxSpread       = 40.0;       // Max spread yang diizinkan (points)
-input int      CooldownSeconds = 60;         // Cooldown antar trade (detik)
+input double RiskPct        = 1.0;    // Risk % per trade
+input double SL_ATR         = 1.5;    // Stop Loss = X * ATR
+input double TP_ATR         = 2.2;    // Take Profit = X * ATR (RR ~1:1.5)
+input bool   UseTrail       = true;   // Trailing stop
+input double Trail_ATR      = 1.0;    // Trailing distance = X * ATR
+input double BE_ATR         = 0.8;    // Break even setelah X * ATR profit
+input int    MaxTrades      = 2;      // Max posisi terbuka
+input double MaxSpreadPts   = 50.0;   // Max spread (points)
+input int    CooldownBars   = 3;      // Cooldown dalam jumlah BAR (bukan detik)
 
-input group "=== SESSION FILTER ==="
-input bool     UseLondonSession   = true;    // Trading sesi London
-input bool     UseNewYorkSession  = true;    // Trading sesi New York
-input bool     UseAsiaSession     = false;   // Trading sesi Asia (lebih volatile)
-input int      LondonOpen         = 7;       // Jam buka London (UTC)
-input int      LondonClose        = 16;      // Jam tutup London (UTC)
-input int      NYOpen             = 12;      // Jam buka New York (UTC)
-input int      NYClose            = 21;      // Jam tutup New York (UTC)
-input int      AsiaOpen           = 0;       // Jam buka Asia (UTC)
-input int      AsiaClose          = 6;       // Jam tutup Asia (UTC)
+input group "=== SESSION (Broker Server Time) ==="
+// PENTING: Gunakan jam server broker, BUKAN UTC
+// Di backtest, TimeCurrent() = server time broker
+input bool   TradeAllDay    = false;  // true = trading 24 jam (untuk test)
+input int    Sess1_Open     = 8;      // Sesi 1 buka (jam server)
+input int    Sess1_Close    = 17;     // Sesi 1 tutup (jam server)
+input int    Sess2_Open     = 13;     // Sesi 2 buka (jam server)
+input int    Sess2_Close    = 22;     // Sesi 2 tutup (jam server)
 
-input group "=== PENGATURAN LAINNYA ==="
-input ulong    MagicNumber     = 20240101;   // Magic Number EA
-input string   TradeComment    = "AntroMarket_Gold";
-input bool     EnableAlerts    = true;       // Aktifkan alert
-input bool     ShowDashboard   = true;       // Tampilkan dashboard
+input group "=== LAINNYA ==="
+input ulong  Magic          = 20240301;
+input string Comment_       = "AM_Gold_v3";
+input bool   ShowInfo       = true;
+input bool   DebugPrint     = false;  // Print debug setiap bar (untuk diagnosa)
 
-//--- Global Variables
-CTrade         Trade;
-CPositionInfo  PositionInfo;
-CSymbolInfo    SymbolInfo;
+//============================================================
+//  GLOBAL
+//============================================================
+CTrade  Trade;
 
-//--- Indicator handles M1
-int    handleEMA_Fast, handleEMA_Mid, handleEMA_Slow;
-int    handleRSI, handleBB, handleMACD, handleATR, handleStoch;
+int  hEMA_F, hEMA_M, hEMA_S;
+int  hRSI, hBB, hMACD, hATR, hStoch;
+int  hHTF_EMA;
 
-//--- Indicator handles HTF
-int    handleHTF_EMA;
+double bufEMAf[], bufEMAm[], bufEMAs[];
+double bufRSI[];
+double bufBBu[], bufBBm[], bufBBl[];
+double bufMACDm[], bufMACDs[];
+double bufATR[];
+double bufStochK[], bufStochD[];
+double bufHTF[];
 
-//--- Buffers M1
-double emaFastBuf[], emaMidBuf[], emaSlowBuf[];
-double rsiBuf[];
-double bbUpperBuf[], bbMidBuf[], bbLowerBuf[];
-double macdMainBuf[], macdSignalBuf[];
-double atrBuf[];
-double stochKBuf[], stochDBuf[];
+datetime lastBar       = 0;
+int      barsSinceEntry = 9999;   // sudah cukup lama = tidak dalam cooldown
+int      totalW        = 0;
+int      totalL        = 0;
+double   totalPnL      = 0;
+string   lastSig       = "-";
 
-//--- Buffers HTF
-double htfEmaBuf[];
-
-datetime lastBarTime   = 0;
-datetime lastTradeTime = 0;
-int      totalWins     = 0;
-int      totalLoss     = 0;
-double   totalProfit   = 0;
-string   lastSignalDesc = "";
-
-//+------------------------------------------------------------------+
-//| Expert initialization function                                   |
-//+------------------------------------------------------------------+
+//============================================================
+//  INIT
+//============================================================
 int OnInit()
 {
-    if(Symbol() != "XAUUSD" && StringFind(Symbol(), "GOLD") < 0)
-        Print("WARNING: EA ini dioptimalkan untuk XAUUSD/GOLD");
+    // Indikator M1
+    hEMA_F  = iMA(_Symbol, PERIOD_M1, EMA_Fast,  0, MODE_EMA, PRICE_CLOSE);
+    hEMA_M  = iMA(_Symbol, PERIOD_M1, EMA_Mid,   0, MODE_EMA, PRICE_CLOSE);
+    hEMA_S  = iMA(_Symbol, PERIOD_M1, EMA_Slow,  0, MODE_EMA, PRICE_CLOSE);
+    hRSI    = iRSI(_Symbol, PERIOD_M1, RSI_Period, PRICE_CLOSE);
+    hBB     = iBands(_Symbol, PERIOD_M1, BB_Period, 0, BB_Dev, PRICE_CLOSE);
+    hMACD   = iMACD(_Symbol, PERIOD_M1, MACD_Fast, MACD_Slow, MACD_Signal, PRICE_CLOSE);
+    hATR    = iATR(_Symbol, PERIOD_M1, ATR_Period);
+    hStoch  = iStochastic(_Symbol, PERIOD_M1, Stoch_K, Stoch_D, Stoch_Slow, MODE_SMA, STO_LOWHIGH);
 
-    //--- M1 indicators
-    handleEMA_Fast = iMA(_Symbol, PERIOD_M1, EMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
-    handleEMA_Mid  = iMA(_Symbol, PERIOD_M1, EMA_Mid,  0, MODE_EMA, PRICE_CLOSE);
-    handleEMA_Slow = iMA(_Symbol, PERIOD_M1, EMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
-    handleRSI      = iRSI(_Symbol, PERIOD_M1, RSI_Period, PRICE_CLOSE);
-    handleBB       = iBands(_Symbol, PERIOD_M1, BB_Period, 0, BB_Dev, PRICE_CLOSE);
-    handleMACD     = iMACD(_Symbol, PERIOD_M1, MACD_Fast, MACD_Slow, MACD_Signal, PRICE_CLOSE);
-    handleATR      = iATR(_Symbol, PERIOD_M1, ATR_Period);
-    handleStoch    = iStochastic(_Symbol, PERIOD_M1, Stoch_K, Stoch_D, Stoch_Slowing,
-                                 MODE_SMA, STO_LOWHIGH);
+    // Indikator HTF
+    hHTF_EMA = iMA(_Symbol, PERIOD_M5, HTF_EMA, 0, MODE_EMA, PRICE_CLOSE);
 
-    //--- HTF indicator
-    handleHTF_EMA  = iMA(_Symbol, HTF_TF, HTF_EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+    bool ok = (hEMA_F != INVALID_HANDLE && hEMA_M != INVALID_HANDLE &&
+               hEMA_S != INVALID_HANDLE && hRSI   != INVALID_HANDLE &&
+               hBB    != INVALID_HANDLE && hMACD  != INVALID_HANDLE &&
+               hATR   != INVALID_HANDLE && hStoch != INVALID_HANDLE &&
+               hHTF_EMA != INVALID_HANDLE);
 
-    if(handleEMA_Fast == INVALID_HANDLE || handleEMA_Mid == INVALID_HANDLE ||
-       handleEMA_Slow == INVALID_HANDLE || handleRSI == INVALID_HANDLE ||
-       handleBB == INVALID_HANDLE || handleMACD == INVALID_HANDLE ||
-       handleATR == INVALID_HANDLE || handleStoch == INVALID_HANDLE ||
-       handleHTF_EMA == INVALID_HANDLE)
-    {
-        Print("ERROR: Gagal membuat handle indikator!");
-        return INIT_FAILED;
-    }
+    if(!ok) { Print("ERROR: Handle indikator gagal!"); return INIT_FAILED; }
 
-    //--- Set array sebagai series
-    ArraySetAsSeries(emaFastBuf,    true);
-    ArraySetAsSeries(emaMidBuf,     true);
-    ArraySetAsSeries(emaSlowBuf,    true);
-    ArraySetAsSeries(rsiBuf,        true);
-    ArraySetAsSeries(bbUpperBuf,    true);
-    ArraySetAsSeries(bbMidBuf,      true);
-    ArraySetAsSeries(bbLowerBuf,    true);
-    ArraySetAsSeries(macdMainBuf,   true);
-    ArraySetAsSeries(macdSignalBuf, true);
-    ArraySetAsSeries(atrBuf,        true);
-    ArraySetAsSeries(stochKBuf,     true);
-    ArraySetAsSeries(stochDBuf,     true);
-    ArraySetAsSeries(htfEmaBuf,     true);
+    ArraySetAsSeries(bufEMAf,  true); ArraySetAsSeries(bufEMAm, true);
+    ArraySetAsSeries(bufEMAs,  true); ArraySetAsSeries(bufRSI,  true);
+    ArraySetAsSeries(bufBBu,   true); ArraySetAsSeries(bufBBm,  true);
+    ArraySetAsSeries(bufBBl,   true); ArraySetAsSeries(bufMACDm,true);
+    ArraySetAsSeries(bufMACDs, true); ArraySetAsSeries(bufATR,  true);
+    ArraySetAsSeries(bufStochK,true); ArraySetAsSeries(bufStochD,true);
+    ArraySetAsSeries(bufHTF,   true);
 
-    Trade.SetExpertMagicNumber(MagicNumber);
-    Trade.SetDeviationInPoints(50);
+    Trade.SetExpertMagicNumber(Magic);
+    Trade.SetDeviationInPoints(100);  // 10 pip slippage tolerance untuk gold
     Trade.SetTypeFilling(ORDER_FILLING_IOC);
 
-    Print("AntroMarket Gold EA v2.0 - Initialized");
-    Print("Symbol: ", _Symbol, " | TF: M1 | HTF: ", EnumToString(HTF_TF));
-    Print("Strategies: BB Bounce=", UseStrategy_BBBounce,
-          " | Pullback=", UseStrategy_Pullback,
-          " | Breakout=", UseStrategy_Breakout);
+    // Init cooldown: set lastBar ke waktu yang sangat lama agar tidak block
+    lastBar = 0;
+    barsSinceEntry = 9999;
 
+    Print("AntroMarket Gold EA v3.0 OK | Symbol:", _Symbol,
+          " | TradeAllDay:", TradeAllDay,
+          " | MinConfirm:", MinConfirm,
+          " | UseHTF:", UseHTF);
     return INIT_SUCCEEDED;
 }
 
-//+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
-//+------------------------------------------------------------------+
+//============================================================
+//  DEINIT
+//============================================================
 void OnDeinit(const int reason)
 {
-    IndicatorRelease(handleEMA_Fast);
-    IndicatorRelease(handleEMA_Mid);
-    IndicatorRelease(handleEMA_Slow);
-    IndicatorRelease(handleRSI);
-    IndicatorRelease(handleBB);
-    IndicatorRelease(handleMACD);
-    IndicatorRelease(handleATR);
-    IndicatorRelease(handleStoch);
-    IndicatorRelease(handleHTF_EMA);
-
+    int handles[9];
+    handles[0]=hEMA_F; handles[1]=hEMA_M; handles[2]=hEMA_S;
+    handles[3]=hRSI;   handles[4]=hBB;    handles[5]=hMACD;
+    handles[6]=hATR;   handles[7]=hStoch; handles[8]=hHTF_EMA;
+    for(int i=0;i<9;i++) IndicatorRelease(handles[i]);
     Comment("");
-    Print("EA Dihentikan. Total Win: ", totalWins, " | Loss: ", totalLoss,
-          " | Net P/L: ", DoubleToString(totalProfit, 2));
+    Print("EA Stop | W:", totalW, " L:", totalL, " PnL:", DoubleToString(totalPnL,2));
 }
 
-//+------------------------------------------------------------------+
-//| Expert tick function                                             |
-//+------------------------------------------------------------------+
+//============================================================
+//  ONTICK
+//============================================================
 void OnTick()
 {
-    datetime currentBar = iTime(_Symbol, PERIOD_M1, 0);
+    // Trailing stop tiap tick
+    if(UseTrail) ManageTrail();
 
-    // Manage trailing stop setiap tick
-    if(UseTrailingStop) ManageTrailingStop();
-    if(ShowDashboard)   UpdateDashboard();
+    datetime curBar = iTime(_Symbol, PERIOD_M1, 0);
+    if(curBar == lastBar)
+    {
+        if(ShowInfo) DrawDash();
+        return;
+    }
+    // Bar baru
+    lastBar = curBar;
+    barsSinceEntry++;
 
-    // Entry hanya di bar baru
-    if(currentBar == lastBarTime) return;
-    lastBarTime = currentBar;
+    if(!LoadBuffers()) return;
 
-    // Ambil data indikator
-    if(!RefreshIndicatorData()) return;
+    // --- Filter: session
+    if(!SessionOK())
+    {
+        if(DebugPrint) Print("SKIP: Session tutup jam=", GetServerHour());
+        if(ShowInfo) DrawDash();
+        return;
+    }
 
-    // Filter kondisi trading
-    if(!IsSessionActive())  return;
-    if(!CheckSpread())      return;
-    if(CountOpenTrades() >= MaxOpenTrades) return;
+    // --- Filter: spread
+    double spd = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+    if(spd > MaxSpreadPts)
+    {
+        if(DebugPrint) Print("SKIP: Spread ", spd, " > max ", MaxSpreadPts);
+        if(ShowInfo) DrawDash();
+        return;
+    }
 
-    // Cooldown antar trade
-    if((int)(TimeCurrent() - lastTradeTime) < CooldownSeconds) return;
+    // --- Filter: max trades
+    if(CountMyTrades() >= MaxTrades)
+    {
+        if(DebugPrint) Print("SKIP: MaxTrades reached");
+        if(ShowInfo) DrawDash();
+        return;
+    }
 
-    // Generate sinyal
-    int    signal = 0;
-    string desc   = "";
+    // --- Filter: cooldown (bar-based, lebih reliable di backtest)
+    if(barsSinceEntry < CooldownBars)
+    {
+        if(DebugPrint) Print("SKIP: Cooldown, bars since last entry=", barsSinceEntry);
+        if(ShowInfo) DrawDash();
+        return;
+    }
 
-    //--- Coba 3 strategi entry
-    if(signal == 0 && UseStrategy_BBBounce)  signal = Strategy_BBBounce(desc);
-    if(signal == 0 && UseStrategy_Pullback)  signal = Strategy_Pullback(desc);
-    if(signal == 0 && UseStrategy_Breakout)  signal = Strategy_Breakout(desc);
+    // --- Generate sinyal
+    int sig = GetSignal();
+    if(DebugPrint) Print("Bar signal=", sig, " | RSI=", DoubleToString(bufRSI[1],1),
+                         " | StochK=", DoubleToString(bufStochK[1],1));
 
-    if(signal == 1)  { lastSignalDesc = desc; OpenBuy();  }
-    if(signal == -1) { lastSignalDesc = desc; OpenSell(); }
+    if(sig == 1  && !HasPos(ORDER_TYPE_BUY))  DoOpen(sig);
+    if(sig == -1 && !HasPos(ORDER_TYPE_SELL)) DoOpen(sig);
+
+    if(ShowInfo) DrawDash();
 }
 
-//+------------------------------------------------------------------+
-//| Refresh semua data indikator                                     |
-//+------------------------------------------------------------------+
-bool RefreshIndicatorData()
+//============================================================
+//  LOAD BUFFERS
+//============================================================
+bool LoadBuffers()
 {
-    int bars = 6;
-
-    if(CopyBuffer(handleEMA_Fast, 0, 0, bars, emaFastBuf)    < bars) return false;
-    if(CopyBuffer(handleEMA_Mid,  0, 0, bars, emaMidBuf)     < bars) return false;
-    if(CopyBuffer(handleEMA_Slow, 0, 0, bars, emaSlowBuf)    < bars) return false;
-    if(CopyBuffer(handleRSI,      0, 0, bars, rsiBuf)        < bars) return false;
-    if(CopyBuffer(handleBB, UPPER_BAND, 0, bars, bbUpperBuf) < bars) return false;
-    if(CopyBuffer(handleBB, BASE_LINE,  0, bars, bbMidBuf)   < bars) return false;
-    if(CopyBuffer(handleBB, LOWER_BAND, 0, bars, bbLowerBuf) < bars) return false;
-    if(CopyBuffer(handleMACD, 0, 0, bars, macdMainBuf)       < bars) return false;
-    if(CopyBuffer(handleMACD, 1, 0, bars, macdSignalBuf)     < bars) return false;
-    if(CopyBuffer(handleATR,  0, 0, bars, atrBuf)            < bars) return false;
-    if(CopyBuffer(handleStoch, 0, 0, bars, stochKBuf)        < bars) return false;
-    if(CopyBuffer(handleStoch, 1, 0, bars, stochDBuf)        < bars) return false;
-    if(CopyBuffer(handleHTF_EMA, 0, 0, 3, htfEmaBuf)         < 3)    return false;
-
+    int N = 5;
+    if(CopyBuffer(hEMA_F, 0, 0, N, bufEMAf)  < N) return false;
+    if(CopyBuffer(hEMA_M, 0, 0, N, bufEMAm)  < N) return false;
+    if(CopyBuffer(hEMA_S, 0, 0, N, bufEMAs)  < N) return false;
+    if(CopyBuffer(hRSI,   0, 0, N, bufRSI)   < N) return false;
+    if(CopyBuffer(hBB, UPPER_BAND, 0, N, bufBBu) < N) return false;
+    if(CopyBuffer(hBB, BASE_LINE,  0, N, bufBBm) < N) return false;
+    if(CopyBuffer(hBB, LOWER_BAND, 0, N, bufBBl) < N) return false;
+    if(CopyBuffer(hMACD, 0, 0, N, bufMACDm)  < N) return false;
+    if(CopyBuffer(hMACD, 1, 0, N, bufMACDs)  < N) return false;
+    if(CopyBuffer(hATR,  0, 0, N, bufATR)    < N) return false;
+    if(CopyBuffer(hStoch,0, 0, N, bufStochK) < N) return false;
+    if(CopyBuffer(hStoch,1, 0, N, bufStochD) < N) return false;
+    // HTF: ambil lebih banyak untuk memastikan ada data
+    if(CopyBuffer(hHTF_EMA, 0, 0, 5, bufHTF) < 2) return false;
     return true;
 }
 
-//+------------------------------------------------------------------+
-//| Cek arah HTF (Higher Timeframe filter)                           |
-//| Return: 1=bullish, -1=bearish, 0=netral                         |
-//+------------------------------------------------------------------+
-int GetHTFBias()
+//============================================================
+//  SESSION FILTER  — pakai TimeCurrent() = server broker time
+//  Berlaku di live DAN di Strategy Tester
+//============================================================
+int GetServerHour()
 {
-    if(!UseHTF_Filter) return 0; // 0 = tidak difilter
+    MqlDateTime dt;
+    TimeToStruct(TimeCurrent(), dt);
+    return dt.hour;
+}
 
-    double htfClose = iClose(_Symbol, HTF_TF, 1);
-    double htfEMA   = htfEmaBuf[1];
+bool SessionOK()
+{
+    if(TradeAllDay) return true;
+    int h = GetServerHour();
+    bool s1 = (h >= Sess1_Open && h < Sess1_Close);
+    bool s2 = (h >= Sess2_Open && h < Sess2_Close);
+    return (s1 || s2);
+}
 
-    if(htfClose > htfEMA * 1.0001) return 1;   // Harga di atas EMA HTF = bullish
-    if(htfClose < htfEMA * 0.9999) return -1;  // Harga di bawah EMA HTF = bearish
+//============================================================
+//  HTF BIAS — return 1/0/-1
+//  Jika HTF buffer belum siap, return 0 (netral = tidak filter)
+//============================================================
+int HTFBias()
+{
+    if(!UseHTF) return 0;
+    // Ambil data HTF terbaru (index 1 = last closed M5 bar)
+    double htfEMA   = (ArraySize(bufHTF) >= 2) ? bufHTF[1] : bufHTF[0];
+    double htfClose = iClose(_Symbol, PERIOD_M5, 1);
+    if(htfClose <= 0 || htfEMA <= 0) return 0; // data belum siap
+    if(htfClose > htfEMA + _Point * 5) return  1;
+    if(htfClose < htfEMA - _Point * 5) return -1;
     return 0;
 }
 
-//+------------------------------------------------------------------+
-//| STRATEGI A: BB Bounce / Mean Reversion                          |
-//|   BUY : harga sentuh/lewati BB lower, RSI oversold, stoch cross  |
-//|   SELL: harga sentuh/lewati BB upper, RSI overbought, stoch cross |
-//+------------------------------------------------------------------+
-int Strategy_BBBounce(string &desc)
+//============================================================
+//  SIGNAL GENERATOR
+//  Menggabungkan 3 setup sederhana dengan scoring
+//============================================================
+int GetSignal()
 {
-    double close1 = iClose(_Symbol, PERIOD_M1, 1);
-    double close2 = iClose(_Symbol, PERIOD_M1, 2);
-    double low1   = iLow(_Symbol,   PERIOD_M1, 1);
-    double high1  = iHigh(_Symbol,  PERIOD_M1, 1);
+    double atr   = bufATR[1];
+    double close1= iClose(_Symbol, PERIOD_M1, 1);
+    double close2= iClose(_Symbol, PERIOD_M1, 2);
+    double low1  = iLow(_Symbol,   PERIOD_M1, 1);
+    double high1 = iHigh(_Symbol,  PERIOD_M1, 1);
+    double open1 = iOpen(_Symbol,  PERIOD_M1, 1);
 
-    double bbUpper = bbUpperBuf[1];
-    double bbLower = bbLowerBuf[1];
-    double bbMid   = bbMidBuf[1];
-    double rsi     = rsiBuf[1];
-    double rsiPrev = rsiBuf[2];
-    double stochK  = stochKBuf[1];
-    double stochD  = stochDBuf[1];
-    double stochKp = stochKBuf[2];
-    double stochDp = stochDBuf[2];
-    double macdMain = macdMainBuf[1];
-    double macdSig  = macdSignalBuf[1];
-    int    htfBias  = GetHTFBias();
+    double emaF  = bufEMAf[1]; double emaF2 = bufEMAf[2];
+    double emaM  = bufEMAm[1];
+    double emaS  = bufEMAs[1];
+    double rsi   = bufRSI[1];  double rsi2  = bufRSI[2];
+    double bbU   = bufBBu[1];  double bbU2  = bufBBu[2];
+    double bbL   = bufBBl[1];  double bbL2  = bufBBl[2];
+    double bbM   = bufBBm[1];
+    double macdM = bufMACDm[1]; double macdM2= bufMACDm[2];
+    double macdS = bufMACDs[1]; double macdS2= bufMACDs[2];
+    double stK   = bufStochK[1]; double stK2 = bufStochK[2];
+    double stD   = bufStochD[1]; double stD2 = bufStochD[2];
 
-    // === BUY: BB lower bounce ===
-    bool priceTouchedLower = (low1 <= bbLower * 1.0002);   // wick ke BB lower
-    bool priceClosedAbove  = (close1 > bbLower);            // close di atas BB lower
-    bool rsiOversold       = (rsi < RSI_Oversold + 8) && (rsi > 10); // RSI oversold zone
-    bool stochBuyCross     = (stochKp < stochDp) && (stochK > stochD) && (stochK < Stoch_OB);
-    bool macdPositive      = (macdMain > macdSig) || (macdMain > macdMainBuf[2]); // MACD naik
-    bool htfOkBuy          = (htfBias >= 0); // HTF bullish atau netral
+    int htf = HTFBias();
+    bool htfBull = (htf >= 0);   // 0 = netral = boleh buy
+    bool htfBear = (htf <= 0);   // 0 = netral = boleh sell
 
-    int buyScore = (priceTouchedLower ? 1 : 0) +
-                   (rsiOversold       ? 1 : 0) +
-                   (stochBuyCross     ? 1 : 0) +
-                   (macdPositive      ? 1 : 0) +
-                   (priceClosedAbove  ? 1 : 0);
+    // Candle direction
+    bool bullCandle = (close1 > open1);
+    bool bearCandle = (close1 < open1);
 
-    if(buyScore >= MinScoreRequired && htfOkBuy && !HasOpenPosition(ORDER_TYPE_BUY))
-    {
-        desc = StringFormat("BB_Bounce_BUY sc=%d RSI=%.1f StochK=%.1f", buyScore, rsi, stochK);
-        return 1;
-    }
+    // ── KONDISI BUY ──────────────────────────────────────────
+    // [1] EMA trend bullish (EMA9 di atas EMA50)
+    bool buy_ema    = (emaF > emaS);
 
-    // === SELL: BB upper rejection ===
-    bool priceTouchedUpper = (high1 >= bbUpper * 0.9998);  // wick ke BB upper
-    bool priceClosedBelow  = (close1 < bbUpper);            // close di bawah BB upper
-    bool rsiOverbought     = (rsi > RSI_Overbought - 8) && (rsi < 90);
-    bool stochSellCross    = (stochKp > stochDp) && (stochK < stochD) && (stochK > Stoch_OS);
-    bool macdNegative      = (macdMain < macdSig) || (macdMain < macdMainBuf[2]); // MACD turun
-    bool htfOkSell         = (htfBias <= 0); // HTF bearish atau netral
+    // [2] Harga di atas atau dekat EMA mid (tidak terlalu jauh)
+    bool buy_pos    = (close1 > emaM - atr * 0.5);
 
-    int sellScore = (priceTouchedUpper ? 1 : 0) +
-                    (rsiOverbought     ? 1 : 0) +
-                    (stochSellCross    ? 1 : 0) +
-                    (macdNegative      ? 1 : 0) +
-                    (priceClosedBelow  ? 1 : 0);
+    // [3] RSI tidak overbought dan naik (atau sudah di atas 40)
+    bool buy_rsi    = (rsi > 35.0 && rsi < 75.0);
 
-    if(sellScore >= MinScoreRequired && htfOkSell && !HasOpenPosition(ORDER_TYPE_SELL))
-    {
-        desc = StringFormat("BB_Bounce_SELL sc=%d RSI=%.1f StochK=%.1f", sellScore, rsi, stochK);
-        return -1;
-    }
+    // [4] Stochastic K tidak OB, atau baru cross up dari bawah
+    bool buy_stoch  = (stK < 80.0) || ((stK2 < stD2) && (stK > stD));
 
-    return 0;
-}
+    // [5] MACD di atas nol atau macd line naik
+    bool buy_macd   = (macdM > 0.0) || (macdM > macdM2);
 
-//+------------------------------------------------------------------+
-//| STRATEGI B: EMA Pullback (Trend Continuation)                   |
-//|   BUY : Trend bullish, harga pullback ke EMA21, bounce up        |
-//|   SELL: Trend bearish, harga pullback ke EMA21, bounce down      |
-//+------------------------------------------------------------------+
-int Strategy_Pullback(string &desc)
-{
-    double close1  = iClose(_Symbol, PERIOD_M1, 1);
-    double close2  = iClose(_Symbol, PERIOD_M1, 2);
-    double low1    = iLow(_Symbol,   PERIOD_M1, 1);
-    double high1   = iHigh(_Symbol,  PERIOD_M1, 1);
+    // [6] Harga dekat/touch BB lower (untuk BB bounce setup)
+    bool buy_bbl    = (low1 <= bbL + atr * 0.3);
 
-    double emaFast = emaFastBuf[1];
-    double emaMid  = emaMidBuf[1];
-    double emaSlow = emaSlowBuf[1];
-    double rsi     = rsiBuf[1];
-    double macdMain    = macdMainBuf[1];
-    double macdSig     = macdSignalBuf[1];
-    double macdMainPrv = macdMainBuf[2];
-    double macdSigPrv  = macdSignalBuf[2];
-    double stochK  = stochKBuf[1];
-    double stochD  = stochDBuf[1];
-    double stochKp = stochKBuf[2];
-    double stochDp = stochDBuf[2];
-    double atr     = atrBuf[1];
-    int    htfBias = GetHTFBias();
+    // [7] RSI bounce dari oversold
+    bool buy_rsibounce = (rsi2 < 40.0 && rsi > rsi2);
 
-    // Toleransi pullback ke EMA: dalam radius 0.5*ATR dari EMA21
-    double emaMidTol = atr * 0.5;
+    // [8] Stochastic bullish cross di zona oversold
+    bool buy_stochcross = ((stK2 < stD2) && (stK >= stD) && stK < 60.0);
 
-    // === BUY: Trend bullish + pullback ke EMA21 ===
-    bool trendBullish    = (emaFast > emaSlow) && (emaMid > emaSlow); // EMA aligned
-    bool pricePullback   = (low1 <= emaMid + emaMidTol) && (close1 > emaMid - emaMidTol);
-    bool closedAboveEMA  = (close1 > emaMid);                 // close di atas EMA21
-    bool macdBullish     = (macdMain > 0) || (macdMainPrv < macdSigPrv && macdMain >= macdSig);
-    bool stochNotOB      = (stochK < Stoch_OB);               // Stoch belum overbought
-    bool rsiMidRange     = (rsi > 40 && rsi < 70);            // RSI di zona tengah-bullish
-    bool htfOkBuy        = (htfBias >= 0);
+    // [9] Candle bullish
+    bool buy_candle = bullCandle;
 
-    int buyScore = (trendBullish   ? 1 : 0) +
-                   (pricePullback  ? 1 : 0) +
-                   (closedAboveEMA ? 1 : 0) +
-                   (macdBullish    ? 1 : 0) +
-                   (stochNotOB     ? 1 : 0);
+    // Skor dasar (kondisi trend): maks 5
+    int scoreBuy = (buy_ema    ? 1 : 0) +
+                   (buy_pos    ? 1 : 0) +
+                   (buy_rsi    ? 1 : 0) +
+                   (buy_stoch  ? 1 : 0) +
+                   (buy_macd   ? 1 : 0);
 
-    if(buyScore >= MinScoreRequired && rsiMidRange && htfOkBuy && !HasOpenPosition(ORDER_TYPE_BUY))
-    {
-        desc = StringFormat("EMA_Pullback_BUY sc=%d RSI=%.1f MACD=%.4f", buyScore, rsi, macdMain);
-        return 1;
-    }
+    // Bonus kondisi spesifik (masing-masing +1 jika ada setup kuat)
+    if(buy_bbl)       scoreBuy++;
+    if(buy_rsibounce) scoreBuy++;
+    if(buy_stochcross)scoreBuy++;
+    if(buy_candle)    scoreBuy++;
 
-    // === SELL: Trend bearish + pullback ke EMA21 ===
-    bool trendBearish    = (emaFast < emaSlow) && (emaMid < emaSlow);
-    bool pricePullbackD  = (high1 >= emaMid - emaMidTol) && (close1 < emaMid + emaMidTol);
-    bool closedBelowEMA  = (close1 < emaMid);
-    bool macdBearish     = (macdMain < 0) || (macdMainPrv > macdSigPrv && macdMain <= macdSig);
-    bool stochNotOS      = (stochK > Stoch_OS);
-    bool rsiMidRangeD    = (rsi > 30 && rsi < 60);
-    bool htfOkSell       = (htfBias <= 0);
+    // ── KONDISI SELL ─────────────────────────────────────────
+    bool sell_ema    = (emaF < emaS);
+    bool sell_pos    = (close1 < emaM + atr * 0.5);
+    bool sell_rsi    = (rsi > 25.0 && rsi < 65.0);
+    bool sell_stoch  = (stK > 20.0) || ((stK2 > stD2) && (stK < stD));
+    bool sell_macd   = (macdM < 0.0) || (macdM < macdM2);
+    bool sell_bbu    = (high1 >= bbU - atr * 0.3);
+    bool sell_rsibounce = (rsi2 > 60.0 && rsi < rsi2);
+    bool sell_stochcross = ((stK2 > stD2) && (stK <= stD) && stK > 40.0);
+    bool sell_candle = bearCandle;
 
-    int sellScore = (trendBearish   ? 1 : 0) +
-                    (pricePullbackD ? 1 : 0) +
-                    (closedBelowEMA ? 1 : 0) +
-                    (macdBearish    ? 1 : 0) +
-                    (stochNotOS     ? 1 : 0);
+    int scoreSell = (sell_ema    ? 1 : 0) +
+                    (sell_pos    ? 1 : 0) +
+                    (sell_rsi    ? 1 : 0) +
+                    (sell_stoch  ? 1 : 0) +
+                    (sell_macd   ? 1 : 0);
 
-    if(sellScore >= MinScoreRequired && rsiMidRangeD && htfOkSell && !HasOpenPosition(ORDER_TYPE_SELL))
-    {
-        desc = StringFormat("EMA_Pullback_SELL sc=%d RSI=%.1f MACD=%.4f", sellScore, rsi, macdMain);
-        return -1;
-    }
+    if(sell_bbu)        scoreSell++;
+    if(sell_rsibounce)  scoreSell++;
+    if(sell_stochcross) scoreSell++;
+    if(sell_candle)     scoreSell++;
+
+    if(DebugPrint)
+        Print("scoreBuy=", scoreBuy, " scoreSell=", scoreSell,
+              " htf=", htf, " rsi=", DoubleToString(rsi,1),
+              " stK=", DoubleToString(stK,1), " macdM=", DoubleToString(macdM,5));
+
+    // Entry: score >= MinConfirm DAN HTF tidak berlawanan
+    if(scoreBuy  >= MinConfirm && htfBull) { lastSig = StringFormat("BUY sc=%d", scoreBuy);   return  1; }
+    if(scoreSell >= MinConfirm && htfBear) { lastSig = StringFormat("SELL sc=%d", scoreSell); return -1; }
 
     return 0;
 }
 
-//+------------------------------------------------------------------+
-//| STRATEGI C: BB Breakout Squeeze (Momentum)                      |
-//|   Entry saat BB menyempit (squeeze) lalu breakout ke satu arah   |
-//+------------------------------------------------------------------+
-int Strategy_Breakout(string &desc)
+//============================================================
+//  BUKA ORDER
+//============================================================
+void DoOpen(int direction)
 {
-    double close1  = iClose(_Symbol, PERIOD_M1, 1);
-    double close2  = iClose(_Symbol, PERIOD_M1, 2);
-    double close3  = iClose(_Symbol, PERIOD_M1, 3);
-
-    double bbUpper1 = bbUpperBuf[1];
-    double bbLower1 = bbLowerBuf[1];
-    double bbUpper3 = bbUpperBuf[3];
-    double bbLower3 = bbLowerBuf[3];
-    double bbWidth1 = bbUpper1 - bbLower1;
-    double bbWidth3 = bbUpper3 - bbLower3;
-    double atr      = atrBuf[1];
-
-    double emaFast  = emaFastBuf[1];
-    double emaSlow  = emaSlowBuf[1];
-    double macdMain = macdMainBuf[1];
-    double macdSig  = macdSignalBuf[1];
-    double rsi      = rsiBuf[1];
-    double stochK   = stochKBuf[1];
-    int    htfBias  = GetHTFBias();
-
-    // Squeeze: BB width saat ini lebih sempit dari 3 bar lalu
-    bool squeeze = (bbWidth1 < bbWidth3 * 0.85);
-
-    // Breakout: close menembus BB upper/lower
-    bool breakoutUp   = (close1 > bbUpper1) && (close2 <= bbUpper3 * 1.001);
-    bool breakoutDown = (close1 < bbLower1) && (close2 >= bbLower3 * 0.999);
-
-    // Konfirmasi momentum
-    bool momentumUp   = (macdMain > macdSig) && (emaFast > emaSlow) && (rsi > 50) && (rsi < 80);
-    bool momentumDown = (macdMain < macdSig) && (emaFast < emaSlow) && (rsi < 50) && (rsi > 20);
-
-    bool htfOkBuy  = (htfBias >= 0);
-    bool htfOkSell = (htfBias <= 0);
-
-    if(squeeze && breakoutUp && momentumUp && htfOkBuy && !HasOpenPosition(ORDER_TYPE_BUY))
-    {
-        desc = StringFormat("BB_Breakout_BUY squeeze=%.2f RSI=%.1f", bbWidth1, rsi);
-        return 1;
-    }
-
-    if(squeeze && breakoutDown && momentumDown && htfOkSell && !HasOpenPosition(ORDER_TYPE_SELL))
-    {
-        desc = StringFormat("BB_Breakout_SELL squeeze=%.2f RSI=%.1f", bbWidth1, rsi);
-        return -1;
-    }
-
-    return 0;
-}
-
-//+------------------------------------------------------------------+
-//| Buka posisi BUY                                                  |
-//+------------------------------------------------------------------+
-void OpenBuy()
-{
-    double atr   = atrBuf[1];
-    double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-    double sl    = ask - (atr * ATR_SL_Multi);
-    double tp    = ask + (atr * ATR_TP_Multi);
-    double lots  = CalculateLotSize(atr * ATR_SL_Multi);
-
+    double atr   = bufATR[1];
+    double slDist= atr * SL_ATR;
+    double tpDist= atr * TP_ATR;
+    double lots  = CalcLots(slDist);
     if(lots <= 0) return;
 
-    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-    sl = NormalizeDouble(sl, digits);
-    tp = NormalizeDouble(tp, digits);
+    int dg = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    bool result = false;
 
-    if(Trade.Buy(lots, _Symbol, ask, sl, tp, TradeComment + "|" + lastSignalDesc))
+    if(direction == 1)
     {
-        lastTradeTime = TimeCurrent();
-        if(EnableAlerts)
-            Alert("AntroMarket BUY: ", _Symbol, " | Lots: ", lots,
-                  " | SL: ", sl, " | TP: ", tp, " | ", lastSignalDesc);
-        Print("BUY | ", ask, " | SL:", sl, " | TP:", tp, " | Lots:", lots,
-              " | ", lastSignalDesc);
+        double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        double sl  = NormalizeDouble(ask - slDist, dg);
+        double tp  = NormalizeDouble(ask + tpDist, dg);
+        result = Trade.Buy(lots, _Symbol, ask, sl, tp, Comment_ + "|" + lastSig);
     }
     else
     {
-        Print("ERROR BUY: ", Trade.ResultRetcodeDescription());
+        double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        double sl  = NormalizeDouble(bid + slDist, dg);
+        double tp  = NormalizeDouble(bid - tpDist, dg);
+        result = Trade.Sell(lots, _Symbol, bid, sl, tp, Comment_ + "|" + lastSig);
     }
-}
 
-//+------------------------------------------------------------------+
-//| Buka posisi SELL                                                 |
-//+------------------------------------------------------------------+
-void OpenSell()
-{
-    double atr   = atrBuf[1];
-    double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    double sl    = bid + (atr * ATR_SL_Multi);
-    double tp    = bid - (atr * ATR_TP_Multi);
-    double lots  = CalculateLotSize(atr * ATR_SL_Multi);
-
-    if(lots <= 0) return;
-
-    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-    sl = NormalizeDouble(sl, digits);
-    tp = NormalizeDouble(tp, digits);
-
-    if(Trade.Sell(lots, _Symbol, bid, sl, tp, TradeComment + "|" + lastSignalDesc))
+    if(result)
     {
-        lastTradeTime = TimeCurrent();
-        if(EnableAlerts)
-            Alert("AntroMarket SELL: ", _Symbol, " | Lots: ", lots,
-                  " | SL: ", sl, " | TP: ", tp, " | ", lastSignalDesc);
-        Print("SELL | ", bid, " | SL:", sl, " | TP:", tp, " | Lots:", lots,
-              " | ", lastSignalDesc);
+        barsSinceEntry = 0;
+        Print(direction == 1 ? "BUY" : "SELL",
+              " | lots=", lots, " | sig=", lastSig,
+              " | atr=", DoubleToString(atr,2));
     }
     else
     {
-        Print("ERROR SELL: ", Trade.ResultRetcodeDescription());
+        Print("ORDER FAILED: ", Trade.ResultRetcodeDescription(),
+              " code=", Trade.ResultRetcode());
     }
 }
 
-//+------------------------------------------------------------------+
-//| Kalkulasi lot berdasarkan % risk (formula diperbaiki)            |
-//+------------------------------------------------------------------+
-double CalculateLotSize(double slDistance)
+//============================================================
+//  KALKULASI LOT — formula bersih
+//============================================================
+double CalcLots(double slDist)
 {
-    if(slDistance <= 0) return 0;
+    if(slDist <= 0) return 0;
+    double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+    double riskAmt   = balance * RiskPct / 100.0;
+    double tickVal   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSz    = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    // Money per lot per price unit
+    double valPerLot = tickVal / tickSz;
+    double lots      = riskAmt / (slDist * valPerLot);
 
-    double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
-    double riskAmount = balance * (RiskPercent / 100.0);
-
-    // Nilai 1 lot per 1 point movement
-    double tickValue  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-    double tickSize   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-
-    // Nilai uang per lot per 1 unit price move
-    double valuePerLotPerPoint = tickValue / tickSize;
-
-    // Hitung lots: riskAmount / (slDistance * valuePerLotPerPoint)
-    double lots = riskAmount / (slDistance * valuePerLotPerPoint);
-
-    // Normalisasi lot
-    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-    double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-
-    lots = MathFloor(lots / stepLot) * stepLot;
-    lots = MathMax(minLot, MathMin(maxLot, lots));
-
+    double minL  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxL  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double step  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    lots = MathFloor(lots / step) * step;
+    lots = MathMax(minL, MathMin(maxL, lots));
     return lots;
 }
 
-//+------------------------------------------------------------------+
-//| Trailing Stop Management                                         |
-//+------------------------------------------------------------------+
-void ManageTrailingStop()
+//============================================================
+//  TRAILING STOP
+//============================================================
+void ManageTrail()
 {
-    if(CopyBuffer(handleATR, 0, 0, 3, atrBuf) < 3) return;
-    double atr       = atrBuf[1];
-    double trailDist = atr * TrailATR_Multi;
-    double beDist    = atr * BreakEvenATR;
+    double atrArr[3];
+    ArraySetAsSeries(atrArr, true);
+    if(CopyBuffer(hATR, 0, 0, 3, atrArr) < 3) return;
+    double atr   = atrArr[1];
+    double trail = atr * Trail_ATR;
+    double beD   = atr * BE_ATR;
 
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    for(int i = PositionsTotal()-1; i >= 0; i--)
     {
-        if(!PositionSelectByTicket(PositionGetTicket(i))) continue;
-        if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
-        if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        ulong ticket = PositionGetTicket(i);
+        if(!PositionSelectByTicket(ticket)) continue;
+        if(PositionGetInteger(POSITION_MAGIC)  != Magic)   continue;
+        if(PositionGetString(POSITION_SYMBOL)  != _Symbol) continue;
 
-        double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-        double currentSL = PositionGetDouble(POSITION_SL);
-        double currentTP = PositionGetDouble(POSITION_TP);
-        int    posType   = (int)PositionGetInteger(POSITION_TYPE);
-        int    digits    = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+        double opn = PositionGetDouble(POSITION_PRICE_OPEN);
+        double csl = PositionGetDouble(POSITION_SL);
+        double ctp = PositionGetDouble(POSITION_TP);
+        int    dg  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+        long   typ = PositionGetInteger(POSITION_TYPE);
 
-        if(posType == POSITION_TYPE_BUY)
+        if(typ == POSITION_TYPE_BUY)
         {
-            double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            double profit = bid - openPrice;
-
-            // Break Even
-            if(profit >= beDist && currentSL < openPrice)
+            double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            double prof  = bid - opn;
+            if(prof >= beD && csl < opn)
             {
-                double newSL = NormalizeDouble(openPrice + _Point * 2, digits);
-                if(newSL > currentSL)
-                    Trade.PositionModify(PositionGetTicket(i), newSL, currentTP);
+                double ns = NormalizeDouble(opn + _Point*2, dg);
+                if(ns > csl) Trade.PositionModify(ticket, ns, ctp);
             }
-            // Trailing Stop
-            else if(profit > trailDist)
+            else if(prof > trail)
             {
-                double newSL = NormalizeDouble(bid - trailDist, digits);
-                if(newSL > currentSL)
-                    Trade.PositionModify(PositionGetTicket(i), newSL, currentTP);
+                double ns = NormalizeDouble(bid - trail, dg);
+                if(ns > csl) Trade.PositionModify(ticket, ns, ctp);
             }
         }
-        else if(posType == POSITION_TYPE_SELL)
+        else if(typ == POSITION_TYPE_SELL)
         {
-            double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            double profit = openPrice - ask;
-
-            // Break Even
-            if(profit >= beDist && currentSL > openPrice)
+            double ask  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            double prof = opn - ask;
+            if(prof >= beD && csl > opn)
             {
-                double newSL = NormalizeDouble(openPrice - _Point * 2, digits);
-                if(newSL < currentSL)
-                    Trade.PositionModify(PositionGetTicket(i), newSL, currentTP);
+                double ns = NormalizeDouble(opn - _Point*2, dg);
+                if(ns < csl) Trade.PositionModify(ticket, ns, ctp);
             }
-            // Trailing Stop
-            else if(profit > trailDist)
+            else if(prof > trail)
             {
-                double newSL = NormalizeDouble(ask + trailDist, digits);
-                if(newSL < currentSL)
-                    Trade.PositionModify(PositionGetTicket(i), newSL, currentTP);
+                double ns = NormalizeDouble(ask + trail, dg);
+                if(ns < csl) Trade.PositionModify(ticket, ns, ctp);
             }
         }
     }
 }
 
-//+------------------------------------------------------------------+
-//| Cek apakah sesi aktif                                            |
-//+------------------------------------------------------------------+
-bool IsSessionActive()
+//============================================================
+//  UTILS
+//============================================================
+int CountMyTrades()
 {
-    MqlDateTime dt;
-    TimeToStruct(TimeGMT(), dt);
-    int hour = dt.hour;
-
-    bool london = UseLondonSession && (hour >= LondonOpen && hour < LondonClose);
-    bool ny     = UseNewYorkSession && (hour >= NYOpen && hour < NYClose);
-    bool asia   = UseAsiaSession && (hour >= AsiaOpen && hour < AsiaClose);
-
-    return (london || ny || asia);
-}
-
-//+------------------------------------------------------------------+
-//| Cek spread                                                       |
-//+------------------------------------------------------------------+
-bool CheckSpread()
-{
-    double spread = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-    return (spread <= MaxSpread);
-}
-
-//+------------------------------------------------------------------+
-//| Hitung jumlah trade terbuka milik EA                             |
-//+------------------------------------------------------------------+
-int CountOpenTrades()
-{
-    int count = 0;
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
-    {
+    int c = 0;
+    for(int i=PositionsTotal()-1; i>=0; i--)
         if(PositionSelectByTicket(PositionGetTicket(i)))
-            if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            if(PositionGetInteger(POSITION_MAGIC) == Magic &&
                PositionGetString(POSITION_SYMBOL) == _Symbol)
-                count++;
-    }
-    return count;
+                c++;
+    return c;
 }
 
-//+------------------------------------------------------------------+
-//| Cek apakah ada posisi terbuka berdasarkan tipe                   |
-//+------------------------------------------------------------------+
-bool HasOpenPosition(ENUM_ORDER_TYPE type)
+bool HasPos(ENUM_ORDER_TYPE t)
 {
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
-    {
+    for(int i=PositionsTotal()-1; i>=0; i--)
         if(PositionSelectByTicket(PositionGetTicket(i)))
-            if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            if(PositionGetInteger(POSITION_MAGIC) == Magic &&
                PositionGetString(POSITION_SYMBOL) == _Symbol &&
-               PositionGetInteger(POSITION_TYPE)  == type)
+               PositionGetInteger(POSITION_TYPE)  == t)
                 return true;
-    }
     return false;
 }
 
-//+------------------------------------------------------------------+
-//| Tracking hasil trade                                             |
-//+------------------------------------------------------------------+
+//============================================================
+//  TRADE HISTORY TRACKING
+//============================================================
 void OnTradeTransaction(const MqlTradeTransaction &trans,
-                        const MqlTradeRequest     &request,
-                        const MqlTradeResult      &result)
+                        const MqlTradeRequest &req,
+                        const MqlTradeResult  &res)
 {
     if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
     {
-        ulong dealTicket = trans.deal;
-        if(HistoryDealSelect(dealTicket))
-        {
-            if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC) == MagicNumber &&
-               HistoryDealGetInteger(dealTicket, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+        ulong dk = trans.deal;
+        if(HistoryDealSelect(dk))
+            if(HistoryDealGetInteger(dk, DEAL_MAGIC) == Magic &&
+               HistoryDealGetInteger(dk, DEAL_ENTRY) == DEAL_ENTRY_OUT)
             {
-                double dealProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
-                totalProfit += dealProfit;
-                if(dealProfit > 0) totalWins++;
-                else               totalLoss++;
+                double p = HistoryDealGetDouble(dk, DEAL_PROFIT);
+                totalPnL += p;
+                if(p > 0) totalW++; else totalL++;
             }
-        }
     }
 }
 
-//+------------------------------------------------------------------+
-//| Update dashboard di chart                                        |
-//+------------------------------------------------------------------+
-void UpdateDashboard()
+//============================================================
+//  DASHBOARD
+//============================================================
+void DrawDash()
 {
-    int    spread  = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-    double atr     = (ArraySize(atrBuf) > 1) ? atrBuf[1] : 0;
-    double rsi     = (ArraySize(rsiBuf) > 1) ? rsiBuf[1] : 0;
-    double stochK  = (ArraySize(stochKBuf) > 1) ? stochKBuf[1] : 0;
-    int    trades  = CountOpenTrades();
-    int    total   = totalWins + totalLoss;
-    double winRate = (total > 0) ? (double)totalWins / total * 100.0 : 0;
-    bool   sesAct  = IsSessionActive();
-    int    htfBias = GetHTFBias();
-    string htfStr  = (htfBias > 0) ? "BULLISH" : (htfBias < 0) ? "BEARISH" : "NEUTRAL";
+    double atr   = (ArraySize(bufATR)    > 1) ? bufATR[1]    : 0;
+    double rsi   = (ArraySize(bufRSI)    > 1) ? bufRSI[1]    : 0;
+    double stk   = (ArraySize(bufStochK) > 1) ? bufStochK[1] : 0;
+    int    spd   = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+    int    tot   = totalW + totalL;
+    double wr    = (tot > 0) ? totalW * 100.0 / tot : 0;
+    int    htfB  = HTFBias();
+    string htfS  = (htfB > 0) ? "BULL" : (htfB < 0) ? "BEAR" : "NEU";
+    string sesS  = SessionOK() ? "AKTIF" : "TUTUP";
+    int    cdB   = (barsSinceEntry < CooldownBars) ? CooldownBars - barsSinceEntry : 0;
 
-    // Cooldown sisa detik
-    int cdLeft = CooldownSeconds - (int)(TimeCurrent() - lastTradeTime);
-    if(cdLeft < 0) cdLeft = 0;
+    string d = "";
+    d += "╔══════════════════════════════╗\n";
+    d += "║  ANTROMARKET GOLD EA v3.0    ║\n";
+    d += "╠══════════════════════════════╣\n";
+    d += StringFormat("║  Symbol  : %-19s║\n", _Symbol);
+    d += StringFormat("║  ATR     : %-19s║\n", DoubleToString(atr,2));
+    d += StringFormat("║  RSI(7)  : %-19s║\n", DoubleToString(rsi,1));
+    d += StringFormat("║  StochK  : %-19s║\n", DoubleToString(stk,1));
+    d += StringFormat("║  Spread  : %-19s║\n", IntegerToString(spd)+" pts");
+    d += StringFormat("║  HTF(M5) : %-19s║\n", htfS);
+    d += StringFormat("║  Sesi    : %-19s║\n", sesS);
+    d += StringFormat("║  Cooldown: %-19s║\n", IntegerToString(cdB)+" bars");
+    d += StringFormat("║  Trades  : %-19s║\n", IntegerToString(CountMyTrades()));
+    d += "╠══════════════════════════════╣\n";
+    d += StringFormat("║  Win     : %-19s║\n", IntegerToString(totalW));
+    d += StringFormat("║  Loss    : %-19s║\n", IntegerToString(totalL));
+    d += StringFormat("║  WinRate : %-19s║\n", DoubleToString(wr,1)+"%");
+    d += StringFormat("║  Net P/L : %-19s║\n", DoubleToString(totalPnL,2));
+    d += "╠══════════════════════════════╣\n";
+    d += StringFormat("║  %-28s║\n", StringSubstr(lastSig,0,28));
+    d += "╚══════════════════════════════╝";
 
-    string dash = "";
-    dash += "╔═══════════════════════════════╗\n";
-    dash += "║   ANTROMARKET GOLD EA v2.0    ║\n";
-    dash += "╠═══════════════════════════════╣\n";
-    dash += StringFormat("║  Symbol   : %-18s ║\n", _Symbol);
-    dash += StringFormat("║  Spread   : %-18s ║\n", IntegerToString(spread) + " pts");
-    dash += StringFormat("║  ATR      : %-18s ║\n", DoubleToString(atr, 2));
-    dash += StringFormat("║  RSI(7)   : %-18s ║\n", DoubleToString(rsi, 1));
-    dash += StringFormat("║  Stoch K  : %-18s ║\n", DoubleToString(stochK, 1));
-    dash += StringFormat("║  HTF Bias : %-18s ║\n", htfStr);
-    dash += StringFormat("║  Session  : %-18s ║\n", sesAct ? "ACTIVE" : "CLOSED");
-    dash += StringFormat("║  Cooldown : %-18s ║\n", IntegerToString(cdLeft) + "s");
-    dash += StringFormat("║  Trades   : %-18s ║\n", IntegerToString(trades));
-    dash += "╠═══════════════════════════════╣\n";
-    dash += StringFormat("║  Win      : %-18s ║\n", IntegerToString(totalWins));
-    dash += StringFormat("║  Loss     : %-18s ║\n", IntegerToString(totalLoss));
-    dash += StringFormat("║  Win Rate : %-18s ║\n", DoubleToString(winRate, 1) + "%");
-    dash += StringFormat("║  Net P/L  : %-18s ║\n", DoubleToString(totalProfit, 2));
-    dash += "╠═══════════════════════════════╣\n";
-    dash += StringFormat("║  %-29s ║\n", lastSignalDesc);
-    dash += "╚═══════════════════════════════╝";
-
-    Comment(dash);
+    Comment(d);
 }
-
 //+------------------------------------------------------------------+
